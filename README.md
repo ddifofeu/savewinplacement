@@ -6,6 +6,17 @@ reboot: same monitor, position, size, workspace, maximized/minimized state and s
 For Ubuntu 24.04 / GNOME 46 on Wayland. Wayland lets only GNOME Shell see and move other apps'
 windows, so this is a Shell extension, with a panel menu and a command line.
 
+## Status
+
+A small personal utility, written and tested on one desktop in November 2026.
+
+- **Real reboot:** on 2026-11-06, all 18 open windows came back ([SW-001](tracker/SW-001-save-open-apps-and-window-placement-restore-them-a.md)).
+- **Waiting on a real login:** terminal zoom and directory restore pass the headless tests, but a
+  second real login hasn't confirmed them yet ([SW-002](tracker/SW-002-save-and-restore-each-terminal-s-zoom-font-size.md), [SW-003](tracker/SW-003-reopen-each-terminal-in-the-directory-it-was-in.md)).
+- **Open bug:** monitor names were missing from one pre-reboot snapshot. Restore still worked through
+  the connector, but a monitor moved to another port wouldn't have matched ([SW-004](tracker/SW-004-monitor-identities-were-null-in-the-pre-reboot-sna.md)).
+- **Not tested:** other GNOME versions (the extension declares 46 only), other distributions, and X11.
+
 ## Install
 
     ./install.sh        # then log out and back in once
@@ -20,8 +31,9 @@ It runs by itself: the layout is saved every 15 seconds and restored at login. T
     savewin save [SLOT]       # save a layout (default slot: manual)
     savewin restore [SLOT]    # default: the desktop as it was at the last login
 
-Layouts are JSON files in `~/.local/state/savewinplacement/`. They contain window titles and
-terminal directories.
+Layouts are JSON files in `~/.local/state/savewinplacement/`. They contain window titles, terminal
+directories and, for apps without a .desktop file, the command line that gets relaunched. Treat them
+as private, and as trusted input: restoring a layout runs those commands.
 
 ## What comes back, and what does not
 
@@ -52,8 +64,20 @@ terminal directories.
 
 The end-to-end test uses a throwaway home and D-Bus, so it never touches the running desktop. Set
 `SAVEWIN_E2E_ALSO_ENABLE=<extension folder>` to run it alongside another extension. Both tests run
-in the pre-commit hook. Work is tracked in `tracker/` (`python3 tools/tracker.py list`).
+in the pre-commit hook for changes to the extension or tests. Work is tracked in `tracker/`
+(`python3 tools/tracker.py list`). Both tests passed on 2026-11-06 at commit `6b4a00b` with GNOME
+Shell 46.0.
 
 `install.sh` gives each install its own random UUID. GNOME asks extensions.gnome.org about every
 user extension and installs what it offers as an update, so a UUID published here could be taken
 over there.
+
+## Design and contribution
+
+I set the requirements for this tool, which are recorded as owner requests in `tracker/`: saving and
+restoring window placement, then terminal zoom and directory. I also did the real-reboot check. When
+one window looked wrong after that reboot, the logs couldn't tell a failed placement from a later
+move, so the restore log was changed to name windows it couldn't place. I then confirmed I had moved
+that window by hand.
+
+The implementation is AI-assisted: every commit carries a Claude co-author trailer.
