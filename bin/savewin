@@ -1,0 +1,56 @@
+#!/usr/bin/env python3
+"""Command line for the Save Window Placement extension.
+
+  savewin save [SLOT]     save the current layout (default slot: manual)
+  savewin restore [SLOT]  bring a layout back (default: the desktop as it was at the last login)
+  savewin list            show the windows being tracked right now
+"""
+import json
+import sys
+
+import gi
+gi.require_version("Gio", "2.0")
+from gi.repository import Gio, GLib
+
+
+def call(method, args=None):
+    connection = Gio.bus_get_sync(Gio.BusType.SESSION)
+    try:
+        reply = connection.call_sync(
+            "org.gnome.Shell", "/io/github/savewinplacement", "io.github.savewinplacement",
+            method, args, None, Gio.DBusCallFlags.NONE, 10000)
+    except GLib.Error as error:
+        sys.exit(f"The extension is not responding. Log out and in once after installing, "
+                 f"and check it is enabled.\n({error.message})")
+    return reply.unpack()[0]
+
+
+def show(state):
+    monitors = {m["connector"]: m for m in state["monitors"]}
+    print(f"{len(state['windows'])} windows on {len(monitors)} monitors"
+          + (" (restoring)" if state["restoring"] else ""))
+    for w in state["windows"]:
+        r = w["rect"]
+        flags = "".join(c for c, on in (("M", w["maximized"]["vertical"] and w["maximized"]["horizontal"]),
+                                        ("F", w["fullscreen"]), ("m", w["minimized"])) if on)
+        print(f"  {w['monitor']['connector'] or '?':8} ws{w['workspace'] + 1} "
+              f"{r['width']}x{r['height']}+{r['x']}+{r['y']} {flags:2} "
+              f"{w['wmClass']}: {(w['title'] or '')[:50]}")
+
+
+def main(argv):
+    command = argv[1] if len(argv) > 1 else "list"
+    slot = argv[2] if len(argv) > 2 else ""
+    if command == "save":
+        print(f"Saved {call('Save', GLib.Variant('(s)', (slot,)))} windows")
+    elif command == "restore":
+        started = call("Restore", GLib.Variant("(s)", (slot,)))
+        print("Restoring" if started else "Nothing to restore (no such layout, or already restoring)")
+    elif command == "list":
+        show(json.loads(call("List")))
+    else:
+        sys.exit(__doc__)
+
+
+if __name__ == "__main__":
+    main(sys.argv)
