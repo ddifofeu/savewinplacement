@@ -7,6 +7,6 @@ reported: 2026-11-06, owner
 blocker: -
 
 ## History
+- 2026-11-06 open: reported by owner
 - 2026-11-06 in-progress: extension, CLI and tests written
 - 2026-11-06 fixed: tests pass headless; awaiting a real reboot by the owner
-- 2026-11-06 open: reported by owner
