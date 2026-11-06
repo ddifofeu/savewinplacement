@@ -20,15 +20,21 @@ It runs by itself: the layout is saved every 15 seconds and restored at login. T
     savewin save [SLOT]       # save a layout (default slot: manual)
     savewin restore [SLOT]    # default: the desktop as it was at the last login
 
-Layouts are JSON files in `~/.local/state/savewinplacement/`. They contain window titles.
+Layouts are JSON files in `~/.local/state/savewinplacement/`. They contain window titles and
+terminal directories.
 
 ## What comes back, and what does not
 
 - **Browsers** (Brave, Chrome and relatives) start with `--restore-last-session`, so their tabs come
   back, and windows are told apart by title. Chromium decides which windows it reopens; any it
   doesn't are listed in a notification.
-- **Other apps** reopen the right number of windows, but their contents are up to them. A terminal
-  comes back as a fresh shell in the same place, Files opens at Home.
+- **GNOME Terminal** windows come back in the directory their shell was in and at their zoom. They
+  are fresh shells: running programs and scrollback do not return. While any terminal has tabs or
+  is held open after its shell exited, all terminals keep their place only: nothing links a shell
+  to its window, so they are paired by count.
+  Minimized terminals keep their directory but not their zoom.
+- **Other apps** reopen the right number of windows, but their contents are up to them. Files opens
+  at Home.
 - **Apps without a .desktop file** are relaunched from the command line they ran with.
 
 ## How saving stays safe

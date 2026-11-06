@@ -23,6 +23,8 @@ const SETTLE_MS = 4000;
 const PLACE_MAX_TRIES = 6;
 // Apps like Brave move their own window just after mapping it, so one correct reading is not enough.
 const PLACE_STABLE_TICKS = 2;
+// Cell sizes are whole pixels, so a zoom can land a step off; the next round corrects it.
+const ZOOM_MAX_ROUNDS = 3;
 
 const DBUS_PATH = '/io/github/savewinplacement';
 const DBUS_XML = `<node>
@@ -79,6 +81,58 @@ function maximizedFlags(window) {
     };
 }
 
+function terminalShells(pid) {
+    const shells = [];
+    const dir = GLib.Dir.open(`/proc/${pid}/task`, 0);
+    for (let task = dir.read_name(); task; task = dir.read_name()) {
+        const [, bytes] = GLib.file_get_contents(`/proc/${pid}/task/${task}/children`);
+        for (const child of decoder.decode(bytes).trim().split(/\s+/).filter(Boolean)) {
+            const pty = GLib.file_read_link(`/proc/${child}/fd/0`);
+            if (pty.startsWith('/dev/pts/'))
+                shells.push({pid: Number(child), pty, cwd: GLib.file_read_link(`/proc/${child}/cwd`)});
+        }
+    }
+    return shells;
+}
+
+// Character grid and shell directory of each terminal window. Blocking costs about 2 ms and spares
+// the save and restore paths a callback. LEAVE_DESCRIPTORS_OPEN is what keeps it there: it lets GLib
+// use posix_spawn, where a plain spawn forks all of gnome-shell, on this thread sync or not.
+function terminalGrids(windows) {
+    const found = new Map();
+    const terminals = windows.filter(w => Logic.isTerminal(w.get_wm_class()));
+    try {
+        for (const pid of new Set(terminals.map(w => w.get_pid()))) {
+            const pairs = Logic.pairTerminals(
+                terminals.filter(w => w.get_pid() === pid)
+                    .map(window => ({window, path: window.get_gtk_window_object_path() ?? ''})),
+                terminalShells(pid));
+            if (!pairs.length)
+                continue;
+            const script = 'for p; do echo "$p $(stty -F "$p" size 2>/dev/null)"; done';
+            const [, out] = GLib.spawn_sync(null,
+                ['sh', '-c', script, 'sh', ...pairs.map(pair => pair.shell.pty)], null,
+                GLib.SpawnFlags.SEARCH_PATH | GLib.SpawnFlags.LEAVE_DESCRIPTORS_OPEN, null);
+            const grids = Logic.parseGrids(decoder.decode(out));
+            for (const {window, shell} of pairs) {
+                if (grids.has(shell.pty))
+                    found.set(window.window, {...grids.get(shell.pty), cwd: shell.cwd});
+            }
+        }
+    } catch (e) {
+        log(`no terminal grids: ${e.message}`);
+    }
+    return found;
+}
+
+function zoomTerminal(window, steps) {
+    const action = new GLib.Variant('(sava{sv})', [steps > 0 ? 'zoom-in' : 'zoom-out', [], {}]);
+    for (let i = 0; i < Math.abs(steps); i++) {
+        Gio.DBus.session.call(window.get_gtk_unique_bus_name(), window.get_gtk_window_object_path(),
+            'org.gtk.Actions', 'Activate', action, null, Gio.DBusCallFlags.NONE, -1, null, null);
+    }
+}
+
 class RestoreJob {
     constructor(extension, snapshot, onDone) {
         this._ext = extension;
@@ -90,6 +144,7 @@ class RestoreJob {
         this._claimed = new Set();
         this._startedAt = Date.now();
         this._timer = 0;
+        this._zoomRounds = 0;
     }
 
     start() {
@@ -139,8 +194,29 @@ class RestoreJob {
             .launch([], global.create_app_launch_context(0, -1));
     }
 
+    // The directory can only be given when the terminal opens.
+    _launchTerminal(entry) {
+        const dir = entry.terminal.cwd;
+        const start = GLib.file_test(dir, GLib.FileTest.IS_DIR) ? dir : GLib.get_home_dir();
+        // The command line follows Exec rules, where a literal % has to be doubled.
+        const quoted = GLib.shell_quote(start).replaceAll('%', '%%');
+        Gio.AppInfo.create_from_commandline(`gnome-terminal --window --working-directory=${quoted}`,
+            'Terminal', Gio.AppInfoCreateFlags.NONE).launch([], global.create_app_launch_context(0, -1));
+    }
+
     _openWindows(group, count) {
         const first = group.entries[0];
+        if (Logic.isTerminal(first.wmClass) && first.terminal?.cwd) {
+            const dirs = [...terminalGrids(this._liveWindows(group)).values()].map(t => t.cwd);
+            for (const entry of Logic.entriesToOpen(group.unplaced, dirs, count)) {
+                try {
+                    this._launchTerminal(entry);
+                } catch (e) {
+                    log(`could not open a terminal: ${e.message}`);
+                }
+            }
+            return;
+        }
         const app = first.appId && Shell.AppSystem.get_default().lookup_app(first.appId);
         for (let i = 0; i < count; i++) {
             if (app)
@@ -172,7 +248,10 @@ class RestoreJob {
             return;
         }
 
-        const described = free.map(window => ({window, title: window.get_title()}));
+        const terminals = Logic.isTerminal(first.wmClass) ? terminalGrids(savableWindows()) : new Map();
+        const described = free.map(window => ({
+            window, title: window.get_title(), cwd: terminals.get(window)?.cwd,
+        }));
         for (const {entry, window: {window}} of Logic.assignWindows(group.unplaced, described)) {
             group.unplaced.splice(group.unplaced.indexOf(entry), 1);
             this._claimed.add(window);
@@ -235,11 +314,35 @@ class RestoreJob {
         }
         target.stable = 0;
         if (target.tries >= PLACE_MAX_TRIES) {
-            target.done = true; // size-stepped apps never match exactly; this is as close as it gets
+            // Size-stepped apps never match exactly; this is as close as it gets.
+            target.done = true;
+            target.gaveUp = `${frame.width}x${frame.height}+${frame.x}+${frame.y}`;
             return;
         }
         target.tries++;
         this._place(target, placement);
+    }
+
+    // Runs once every window is in place, as the frame has to match the saved one for its cell size
+    // to compare. Zooming resizes the window, so a zoomed terminal goes back through placing.
+    _zoomTerminals() {
+        const targets = this._targets.filter(t => t.entry.terminal && !t.entry.minimized);
+        if (!targets.length || this._zoomRounds >= ZOOM_MAX_ROUNDS)
+            return false;
+        this._zoomRounds++;
+        const grids = terminalGrids(savableWindows());
+        let zoomed = false;
+        for (const target of targets) {
+            const live = grids.get(target.window);
+            const steps = live ? Logic.zoomSteps(target.entry.terminal, target.entry.rect, live,
+                target.window.get_frame_rect()) : 0;
+            if (steps === 0)
+                continue;
+            zoomTerminal(target.window, steps);
+            Object.assign(target, {tries: 0, stable: 0, done: false, gaveUp: null});
+            zoomed = true;
+        }
+        return zoomed;
     }
 
     _tick() {
@@ -253,7 +356,8 @@ class RestoreJob {
 
         const waiting = this._groups.some(g => g.unplaced.length > 0);
         const placing = this._targets.some(t => !t.done);
-        if ((!waiting && !placing) || now - this._startedAt > RESTORE_DEADLINE_MS)
+        const overdue = now - this._startedAt > RESTORE_DEADLINE_MS;
+        if (overdue || (!waiting && !placing && !this._zoomTerminals()))
             this._finish();
     }
 
@@ -266,7 +370,13 @@ class RestoreJob {
         top?.window.focus(global.get_current_time());
 
         const missing = this._groups.flatMap(g => g.unplaced.map(e => e.title || e.wmClass));
-        log(`restore done: ${byDepth.length} placed, ${missing.length} not found`);
+        const gaveUp = byDepth.filter(t => t.gaveUp);
+        log(`restore done: ${byDepth.length - gaveUp.length} placed, ${gaveUp.length} gave up, ` +
+            `${missing.length} not found`);
+        for (const {entry, gaveUp: got} of gaveUp) {
+            const {x, y, width, height} = entry.rect;
+            log(`gave up on ${entry.title}: wanted ${width}x${height}+${x}+${y}, got ${got}`);
+        }
         this._onDone(missing);
     }
 }
@@ -358,7 +468,9 @@ export default class SaveWinPlacement extends Extension {
 
     _capture() {
         const monitors = this.monitors();
-        const windows = savableWindows().map((window, stack) => {
+        const open = savableWindows();
+        const grids = terminalGrids(open);
+        const windows = open.map((window, stack) => {
             const monitor = monitors[window.get_monitor()] ?? monitors[0];
             const rect = window.get_frame_rect();
             const appId = realAppId(window);
@@ -375,6 +487,7 @@ export default class SaveWinPlacement extends Extension {
                 maximized: maximizedFlags(window),
                 fullscreen: window.is_fullscreen(),
                 minimized: window.minimized,
+                ...(grids.has(window) ? {terminal: grids.get(window)} : {}),
                 stack,
             };
         });

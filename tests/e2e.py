@@ -123,6 +123,9 @@ def phase_after_reboot():
     if previous.stat().st_mtime_ns != login_copy_time:
         raise SystemExit("FAIL re-enabling ran the login sequence again")
     expect_layout(expected, cli_list(), "re-enabling mid-session relaunches nothing")
+    if not all(m["identity"] for m in cli_list()["monitors"]):
+        raise SystemExit(f"FAIL enabling mid-session lost monitor names: {cli_list()['monitors']}")
+    print("ok enabling mid-session keeps monitor names")
 
     subprocess.run(["gdbus", "call", "--session", "--dest", "org.gnome.ScreenSaver", "--object-path",
                     "/org/gnome/ScreenSaver", "--method", "org.gnome.ScreenSaver.Lock"],
@@ -141,6 +144,114 @@ def phase_empty_session():
     previous = json.loads((state_dir() / "previous-session.json").read_text())
     expect_layout(expected, previous, "auto-restore off keeps previous-session")
     restore_terminals(state["monitors"])
+    terminal_zoom_comes_back()
+    restore_calculator(state["monitors"])
+
+
+def terminal_zoom_comes_back():
+    """Each terminal keeps its own font size: zoom two differently, then lose both and restore."""
+    def run_action(path, name, *params):
+        subprocess.run(["gdbus", "call", "--session", "--dest", "org.gnome.Terminal", "--object-path",
+                        path, "--method", "org.gtk.Actions.Activate", name, f"[{', '.join(params)}]", "{}"],
+                       check=True, capture_output=True)
+
+    def terminals():
+        return [w for w in cli_list()["windows"] if w["wmClass"] == "gnome-terminal-server"]
+
+    def window_paths():
+        out = subprocess.run(["gdbus", "introspect", "--session", "--dest", "org.gnome.Terminal",
+                              "--object-path", "/org/gnome/Terminal/window"],
+                             capture_output=True, text=True).stdout
+        return [f"/org/gnome/Terminal/window/{n.split()[1]}" for n in out.splitlines()
+                if n.strip().startswith("node ") and n.split()[1].isdigit()]
+
+    def stable_grids():
+        def read():
+            first = terminals()
+            time.sleep(1.5)
+            return first if first == terminals() else None
+        return wait_for("terminals to settle", read)
+
+    before = {w["rect"]["x"]: w["terminal"] for w in stable_grids()}
+    paths = window_paths()
+    if len(paths) != 2:
+        raise SystemExit(f"FAIL wanted 2 terminal windows, got {paths}")
+    run_action(paths[0], "zoom-out")
+    run_action(paths[0], "zoom-out")
+    run_action(paths[1], "zoom-in")
+    time.sleep(2)
+    subprocess.run(CLI + ["save", "zoomed"], check=True, capture_output=True)
+    saved = json.loads((state_dir() / "zoomed.json").read_text())
+    saved["windows"] = [w for w in saved["windows"] if w["wmClass"] == "gnome-terminal-server"]
+    (state_dir() / "zoomed.json").write_text(json.dumps(saved))
+    if not all(w.get("terminal") for w in saved["windows"]) or len(saved["windows"]) != 2:
+        raise SystemExit(f"FAIL grids not saved: {saved['windows']}")
+    if not all(w["terminal"]["cwd"] for w in saved["windows"]):
+        raise SystemExit(f"FAIL directories not saved: {saved['windows']}")
+    home = Path(os.environ["HOME"])
+    for window, name in zip(saved["windows"], ("first", "my 100% dir")):
+        (home / name).mkdir()
+        window["terminal"]["cwd"] = str(home / name)
+    (state_dir() / "zoomed.json").write_text(json.dumps(saved))
+
+    for path in paths:
+        run_action(path, "close", "<'window'>")
+    wait_for("terminals to close", lambda: not terminals())
+    subprocess.run(CLI + ["restore", "zoomed"], check=True, capture_output=True)
+    time.sleep(1)
+    wait_for("zoomed restore", done_restoring)
+    time.sleep(1)
+    actual = stable_grids()
+    if len(actual) != 2:
+        raise SystemExit(f"FAIL wanted 2 restored terminals, got {len(actual)}")
+    for want in saved["windows"]:
+        got = [w for w in actual if abs(w["rect"]["x"] - want["rect"]["x"]) < 30 and
+               abs(w["rect"]["y"] - want["rect"]["y"]) < 30]
+        if not got:
+            raise SystemExit(f"FAIL no terminal at {want['rect']}: {[w['rect'] for w in actual]}")
+        if got[0]["terminal"]["cwd"] != want["terminal"]["cwd"]:
+            raise SystemExit(f"FAIL directory lost: {got[0]['terminal']} != {want['terminal']}")
+        # A window at a default zoom shows a different grid in the same frame.
+        cols, rows = want["terminal"]["cols"], want["terminal"]["rows"]
+        if abs(got[0]["terminal"]["cols"] - cols) > 3 or abs(got[0]["terminal"]["rows"] - rows) > 2:
+            raise SystemExit(f"FAIL zoom lost: {got[0]['terminal']} != {want['terminal']} "
+                             f"(frames {got[0]['rect']} {want['rect']}, grids before {before})")
+    print("ok terminals get their zoom and directory back")
+    for path in window_paths():
+        run_action(path, "close", "<'window'>")
+    wait_for("terminals to close", lambda: not terminals())
+
+
+def restore_calculator(monitors):
+    """A real app that picks its own size on opening: a saved tile must still win over that.
+    The height stays above Calculator's minimum, about 510 at this width."""
+    a = monitors[0]
+    base = fixture(monitors)["windows"][0]
+    window = {**base, "appId": "org.gnome.Calculator.desktop", "wmClass": "org.gnome.Calculator",
+              "title": "Calculator", "stack": 0, "workspace": 0,
+              "monitor": {k: a[k] for k in ("identity", "connector")},
+              "rect": dict(x=a["x"] + 700, y=a["y"] + 300, width=800, height=600),
+              "relative": dict(x=700, y=300)}
+    expected = {"monitors": monitors, "windows": [window]}
+    (state_dir() / "calculator.json").write_text(json.dumps(expected))
+    subprocess.run(CLI + ["restore", "calculator"], check=True)
+    time.sleep(1)
+    actual = [w for w in wait_for("calculator", done_restoring)["windows"]
+              if w["wmClass"] == "org.gnome.Calculator"]
+    if len(actual) != 1 or actual[0]["rect"] != window["rect"]:
+        raise SystemExit(f"FAIL calculator at {[w['rect'] for w in actual]}, wanted {window['rect']}")
+    print("ok real app keeps its saved size and position")
+
+    # Below that minimum it can never match: the log has to say so, not count it as placed.
+    window["rect"]["height"] = 450
+    (state_dir() / "calculator.json").write_text(json.dumps(expected))
+    subprocess.run(CLI + ["restore", "calculator"], check=True)
+    time.sleep(1)
+    wait_for("calculator again", done_restoring)
+    log = (Path(os.environ["XDG_RUNTIME_DIR"]) / "phase_empty_session.log").read_text()
+    if "1 gave up" not in log or "gave up on Calculator" not in log:
+        raise SystemExit("FAIL a window that never fit was counted as placed")
+    print("ok restore names a window it could not place")
 
 
 def restore_terminals(monitors):
@@ -239,7 +350,7 @@ def main():
                 (state / "config.json").write_text('{"autoRestore": false}')
                 continue
             result = subprocess.run(
-                ["timeout", "120", "dbus-run-session", "--", sys.executable, __file__, "--login", phase],
+                ["timeout", "180", "dbus-run-session", "--", sys.executable, __file__, "--login", phase],
                 env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
             lines = [l for l in result.stdout.splitlines() if l.startswith(("ok ", "FAIL", "  "))]
             print("\n".join(lines))

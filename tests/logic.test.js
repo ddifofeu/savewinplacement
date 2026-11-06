@@ -85,6 +85,31 @@ check('browser restore flag replaces field codes', Logic.restoringCommandline('/
 check('session-less window ids group by class', Logic.groupKey('window:12', 'MyTool'), 'class:MyTool');
 check('real ids group by id', Logic.groupKey('foo.desktop', 'Foo'), 'foo.desktop');
 
+check('terminals pair by directory, as their titles say nothing',
+    Logic.assignWindows(
+        [{title: 'x', terminal: {cwd: '/a'}}, {title: 'x', terminal: {cwd: '/b'}}],
+        [{title: 'x', cwd: '/b'}, {title: 'x', cwd: '/a'}]).map(p => p.window.cwd), ['/a', '/b']);
+const inDirs = (...dirs) => dirs.map(cwd => ({terminal: {cwd}}));
+check('only terminals not open yet get launched',
+    Logic.entriesToOpen(inDirs('/a', '/b', '/b'), ['/b'], 2).map(e => e.terminal.cwd), ['/a', '/b']);
+check('more terminals open than saved launches nothing',
+    Logic.entriesToOpen(inDirs('/a', '/b', '/c'), [], -2), []);
+
+const frame = {width: 854, height: 705};
+check('same grid needs no zoom', Logic.zoomSteps({cols: 106, rows: 36}, frame, {cols: 106, rows: 36}, frame), 0);
+check('one step smaller font', Logic.zoomSteps({cols: 120, rows: 41}, frame, {cols: 106, rows: 36}, frame), -1);
+check('two steps smaller font', Logic.zoomSteps({cols: 141, rows: 51}, frame, {cols: 106, rows: 36}, frame), -2);
+check('larger font zooms in', Logic.zoomSteps({cols: 106, rows: 36}, frame, {cols: 141, rows: 51}, frame), 2);
+check('a frame a few pixels off changes nothing',
+    Logic.zoomSteps({cols: 106, rows: 36}, frame, {cols: 106, rows: 36}, {width: 860, height: 712}), 0);
+check('stty output parses, and a dead pty is skipped',
+    [...Logic.parseGrids('/dev/pts/0 51 141\n/dev/pts/1 \n')], [['/dev/pts/0', {cols: 141, rows: 51}]]);
+const paths = ['/org/gnome/Terminal/window/10', '/org/gnome/Terminal/window/9'].map(path => ({path}));
+check('windows pair with shells in creation order',
+    Logic.pairTerminals(paths, [{pid: 700}, {pid: 90}]).map(p => [p.window.path.slice(-2), p.shell.pid]),
+    [['/9', 90], ['10', 700]]);
+check('tabs leave terminals unpaired', Logic.pairTerminals(paths, [{pid: 1}, {pid: 2}, {pid: 3}]), []);
+
 print(failures ? `${failures} failed` : 'logic tests passed');
 if (failures)
     imports.system.exit(1);

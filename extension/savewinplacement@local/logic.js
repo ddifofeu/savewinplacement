@@ -36,15 +36,16 @@ export function groupByApp(entries) {
     return groups;
 }
 
-// Pairs saved entries with live windows of one app: exact title first, then a shared title start
-// (titles gain counters and suffixes), then whatever remains in saved order. Each is used once.
+// Pairs saved entries with live windows of one app: same terminal directory first, as new terminals
+// all share a title; then exact title, then a shared title start (titles gain counters and
+// suffixes), then whatever remains in saved order. Each is used once.
 export function assignWindows(entries, windows) {
     const pairs = [];
     const entriesLeft = [...entries];
     const windowsLeft = [...windows];
     const take = matches => {
         for (const entry of [...entriesLeft]) {
-            const window = windowsLeft.find(w => matches(entry.title ?? '', w.title ?? ''));
+            const window = windowsLeft.find(w => matches(entry.title ?? '', w.title ?? '', entry, w));
             if (!window)
                 continue;
             pairs.push({entry, window});
@@ -53,10 +54,65 @@ export function assignWindows(entries, windows) {
         }
     };
     const stem = title => title.replace(/^\(\d+\)\s*/, '').slice(0, 24).toLowerCase();
+    take((_a, _b, entry, w) => entry.terminal?.cwd && entry.terminal.cwd === w.cwd);
     take((a, b) => a !== '' && a === b);
     take((a, b) => stem(a) !== '' && stem(a) === stem(b));
     take(() => true);
     return pairs;
+}
+
+// Terminals still to open, at most `count`: entries whose directory no live terminal already covers.
+export function entriesToOpen(entries, liveDirs, count) {
+    const left = [...liveDirs];
+    return entries.filter(entry => {
+        const found = left.indexOf(entry.terminal?.cwd);
+        if (found < 0)
+            return true;
+        left.splice(found, 1);
+        return false;
+    }).slice(0, Math.max(0, count));
+}
+
+export function isTerminal(wmClass) {
+    return wmClass === 'gnome-terminal-server';
+}
+
+// `stty size` answers "rows cols"; the shell loop reading it prefixes each line with the pty.
+export function parseGrids(output) {
+    const grids = new Map();
+    for (const line of output.split('\n')) {
+        const [pty, rows, cols] = line.trim().split(/\s+/);
+        if (rows > 0 && cols > 0)
+            grids.set(pty, {cols: Number(cols), rows: Number(rows)});
+    }
+    return grids;
+}
+
+// Pairs terminal windows with their shells, as nothing in gnome-terminal links the two. Window
+// paths count up (/org/gnome/Terminal/window/N) and so do shell pids, both in creation order. With
+// tabs there are more shells than windows and no way to tell whose they are, so nothing is paired.
+export function pairTerminals(windows, shells) {
+    if (windows.length !== shells.length)
+        return [];
+    const number = w => Number(w.path.match(/(\d+)$/)?.[1] ?? 0);
+    const byPath = [...windows].sort((a, b) => number(a) - number(b));
+    const byPid = [...shells].sort((a, b) => a.pid - b.pid);
+    return byPath.map((window, i) => ({window, shell: byPid[i]}));
+}
+
+// One press of zoom in or out in GNOME Terminal scales the font by this.
+const ZOOM_STEP = 1.2;
+
+// Presses of zoom in (negative: zoom out) that bring a terminal back to its saved font size.
+// Terminals expose no zoom level, but cell size follows it: the frame divided by the grid. Taking
+// the frame whole counts the title bar too, which cancels out as the two frames are about the same.
+export function zoomSteps(saved, savedFrame, live, liveFrame) {
+    const ratio = dimension => [saved, live]
+        .map((grid, i) => [savedFrame, liveFrame][i][dimension] /
+            grid[dimension === 'width' ? 'cols' : 'rows'])
+        .reduce((a, b) => a / b);
+    const scale = Math.sqrt(ratio('width') * ratio('height'));
+    return Math.round(Math.log(scale) / Math.log(ZOOM_STEP));
 }
 
 export function findMonitor(saved, monitors) {
